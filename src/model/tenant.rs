@@ -3,8 +3,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TrafficPattern {
     Steady,
-    Burst,
-    Random,
+    Bursty,
+    Heavy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
