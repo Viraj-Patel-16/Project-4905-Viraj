@@ -3,7 +3,8 @@ mod sink;
 mod tui;
 mod worker;
 
-fn main() -> anyhow::Result<()> {
-    tui::run()?;
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    tui::run().await?;
     Ok(())
 }

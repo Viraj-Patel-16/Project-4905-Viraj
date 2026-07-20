@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
@@ -28,7 +28,7 @@ impl Default for WorkerState {
 
 pub struct Worker {
     worker_id: String,
-    state: std::sync::Arc<Mutex<WorkerState>>,
+    state: std::sync::Arc<std::sync::Mutex<WorkerState>>,
     receiver: mpsc::Receiver<Task>,
 }
 
@@ -36,12 +36,12 @@ impl Worker {
     pub fn new(worker_id: impl Into<String>, receiver: mpsc::Receiver<Task>) -> Self {
         Self {
             worker_id: worker_id.into(),
-            state: std::sync::Arc::new(Mutex::new(WorkerState::default())),
+            state: std::sync::Arc::new(std::sync::Mutex::new(WorkerState::default())),
             receiver,
         }
     }
 
-    pub fn state_handle(&self) -> std::sync::Arc<Mutex<WorkerState>> {
+    pub fn state_handle(&self) -> std::sync::Arc<std::sync::Mutex<WorkerState>> {
         self.state.clone()
     }
 
@@ -54,7 +54,7 @@ impl Worker {
     async fn run(mut self) {
         while let Some(task) = self.receiver.recv().await {
             {
-                let mut state = self.state.lock().await;
+                let mut state = self.state.lock().expect("worker state lock poisoned");
                 state.current_load = 1;
                 state.is_free = false;
                 state.is_busy = true;
@@ -64,7 +64,7 @@ impl Worker {
             sleep(delay).await;
 
             {
-                let mut state = self.state.lock().await;
+                let mut state = self.state.lock().expect("worker state lock poisoned");
                 state.current_load = 0;
                 state.is_free = true;
                 state.is_busy = false;
@@ -84,21 +84,23 @@ impl Worker {
 
 pub struct WorkerHandle {
     pub worker_id: String,
-    pub state: std::sync::Arc<Mutex<WorkerState>>,
+    pub state: std::sync::Arc<std::sync::Mutex<WorkerState>>,
     sender: mpsc::Sender<Task>,
     pub join_handle: JoinHandle<()>,
 }
 
 impl WorkerHandle {
-    pub async fn submit(&self, task: Task) -> Result<()> {
+    pub fn submit(&self, task: Task) -> Result<()> {
         self.sender
-            .send(task)
-            .await
-            .map_err(|_| anyhow!("worker {} is no longer accepting tasks", self.worker_id))
+            .try_send(task)
+            .map_err(|error| anyhow!("worker {} submit failed: {}", self.worker_id, error))
     }
 
-    pub async fn snapshot_state(&self) -> WorkerState {
-        self.state.lock().await.clone()
+    pub fn snapshot_state(&self) -> WorkerState {
+        self.state
+            .lock()
+            .expect("worker state lock poisoned")
+            .clone()
     }
 
     pub fn close(self) {
@@ -148,16 +150,14 @@ mod tests {
 
         worker
             .submit(task_one)
-            .await
             .expect("first task should be queued");
         worker
             .submit(task_two)
-            .await
             .expect("second task should be queued");
 
         timeout(Duration::from_secs(3), async {
             loop {
-                let snapshot = worker.snapshot_state().await;
+                let snapshot = worker.snapshot_state();
                 if snapshot.processed_tasks >= 2 {
                     break;
                 }
@@ -167,7 +167,7 @@ mod tests {
         .await
         .expect("worker did not process tasks in time");
 
-        let final_state = worker.snapshot_state().await;
+        let final_state = worker.snapshot_state();
         assert!(final_state.is_free);
         assert!(!final_state.is_busy);
         assert_eq!(final_state.current_load, 0);
