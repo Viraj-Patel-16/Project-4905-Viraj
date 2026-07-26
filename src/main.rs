@@ -1,4 +1,6 @@
+mod generator;
 mod model;
+mod sender;
 mod sink;
 mod tui;
 mod worker;

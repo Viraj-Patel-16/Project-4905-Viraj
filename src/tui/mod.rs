@@ -1,20 +1,148 @@
 pub mod app;
 pub mod ui;
 
+use std::collections::BTreeMap;
+use std::io::{Read, Write};
+use std::net::TcpListener;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossterm::event::{self, Event, KeyEventKind};
+use serde::Serialize;
 
 use crate::{
-    model::{NetworkPayload, Task, TrackingMetadata},
+    generator,
+    model::{NetworkPayload, Task, TrackingMetadata, TrafficEvent},
+    sender,
+    sink::{ConsumerSink, JsonLinesSink},
     worker::spawn_worker,
 };
 
 use app::{App, Screen};
 
+struct AutoHttpReceiver {
+    stop: Arc<AtomicBool>,
+    join_handle: Option<thread::JoinHandle<()>>,
+}
+
+impl AutoHttpReceiver {
+    fn start_if_enabled() -> Option<Self> {
+        if !auto_receiver_enabled() {
+            return None;
+        }
+
+        let listener = match TcpListener::bind("127.0.0.1:8080") {
+            Ok(listener) => listener,
+            Err(_) => return None,
+        };
+
+        if listener.set_nonblocking(true).is_err() {
+            return None;
+        }
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_flag = Arc::clone(&stop);
+
+        let join_handle = thread::spawn(move || {
+            let mut read_buffer = [0_u8; 4096];
+            let response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK";
+
+            while !stop_flag.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _addr)) => {
+                        let _ = stream.read(&mut read_buffer);
+                        let _ = stream.write_all(response);
+                        let _ = stream.flush();
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(25));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        Some(Self {
+            stop,
+            join_handle: Some(join_handle),
+        })
+    }
+
+    fn stop(mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.join_handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn auto_receiver_enabled() -> bool {
+    match std::env::var("COMP4905_AUTO_RECEIVER") {
+        Ok(value) => {
+            let normalized = value.trim().to_ascii_lowercase();
+            normalized != "0" && normalized != "false" && normalized != "off"
+        }
+        Err(_) => false,
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct TenantTrafficSummary {
+    tenant_id: String,
+    event_count: usize,
+    total_payload_bytes: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct TrafficGenerationSummary {
+    generated_at_ms: u64,
+    total_events: usize,
+    total_payload_bytes: u64,
+    first_timestamp_ms: Option<u64>,
+    last_timestamp_ms: Option<u64>,
+    tenant_summaries: Vec<TenantTrafficSummary>,
+}
+
+fn build_traffic_summary(events: &[TrafficEvent]) -> TrafficGenerationSummary {
+    let mut by_tenant: BTreeMap<String, (usize, u64)> = BTreeMap::new();
+
+    for event in events {
+        let entry = by_tenant.entry(event.tenant_id.clone()).or_insert((0, 0));
+        entry.0 += 1;
+        entry.1 += u64::from(event.payload_size_bytes);
+    }
+
+    let tenant_summaries = by_tenant
+        .into_iter()
+        .map(|(tenant_id, (event_count, total_payload_bytes))| TenantTrafficSummary {
+            tenant_id,
+            event_count,
+            total_payload_bytes,
+        })
+        .collect();
+
+    TrafficGenerationSummary {
+        generated_at_ms: match SystemTime::now().duration_since(UNIX_EPOCH) {
+            Ok(duration) => duration.as_millis() as u64,
+            Err(_) => 0,
+        },
+        total_events: events.len(),
+        total_payload_bytes: events
+            .iter()
+            .map(|event| u64::from(event.payload_size_bytes))
+            .sum(),
+        first_timestamp_ms: events.first().map(|event| event.timestamp_ms),
+        last_timestamp_ms: events.last().map(|event| event.timestamp_ms),
+        tenant_summaries,
+    }
+}
+
 pub async fn run() -> std::io::Result<()> {
     ratatui::run(|terminal| {
         let mut app = App::default();
+        let mut auto_receiver = AutoHttpReceiver::start_if_enabled();
         let worker = spawn_worker("preview_worker", 256);
         app.worker_preview.worker_id = worker.worker_id.clone();
 
@@ -76,8 +204,48 @@ pub async fn run() -> std::io::Result<()> {
                 }
             }
 
+            if app.take_generate_export_request() {
+                let output_path = "results/traffic_events.jsonl";
+                let summary_output_path = "results/traffic_summary.json";
+                let profiles = app.tenants.clone();
+                let events = generator::generate(&profiles, app.target_config.system);
+
+                let export_result = (|| -> anyhow::Result<()> {
+                    let mut sink = JsonLinesSink::new(output_path)?;
+                    for event in &events {
+                        sink.consume(event)?;
+                    }
+                    sink.flush()?;
+
+                    let summary = build_traffic_summary(&events);
+                    if let Some(parent) = std::path::Path::new(summary_output_path).parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    let summary_json = serde_json::to_vec_pretty(&summary)?;
+                    std::fs::write(summary_output_path, summary_json)?;
+                    Ok(())
+                })();
+
+                match export_result {
+                    Ok(()) => {
+                        let send_report = sender::send_events(&events, &app.target_config);
+                        app.set_send_report(
+                            send_report.attempted,
+                            send_report.succeeded,
+                            send_report.failed,
+                            send_report.last_error,
+                        );
+                        app.set_generation_result(events, output_path);
+                    }
+                    Err(error) => app.set_generation_error(error.to_string()),
+                }
+            }
+
             if app.should_quit {
                 worker.close();
+                if let Some(receiver) = auto_receiver.take() {
+                    receiver.stop();
+                }
                 break Ok(());
             }
         }

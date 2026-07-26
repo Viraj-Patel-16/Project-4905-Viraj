@@ -105,6 +105,7 @@ impl WorkerHandle {
 
     pub fn close(self) {
         drop(self.sender);
+        self.join_handle.abort();
     }
 }
 

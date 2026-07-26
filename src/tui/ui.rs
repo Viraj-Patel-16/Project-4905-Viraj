@@ -6,7 +6,7 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
 };
 
-use super::app::{AddTenantField, App, Screen, TenantFormMode};
+use super::app::{AddTenantField, App, Screen, TargetField, TenantFormMode};
 
 pub fn render(frame: &mut Frame, app: &App) {
     let layout = Layout::default()
@@ -29,6 +29,8 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
         Screen::Tenants => "Tenants",
         Screen::AddTenant => "Add Tenant",
         Screen::Preview => "Traffic Preview",
+        Screen::GeneratedEvents => "Generated Events",
+        Screen::Target => "Target Config",
         Screen::Help => "Help",
     };
 
@@ -36,6 +38,8 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
         (Screen::Dashboard, "Dashboard"),
         (Screen::Tenants, "Tenants"),
         (Screen::Preview, "Preview"),
+        (Screen::GeneratedEvents, "Events"),
+        (Screen::Target, "Target"),
         (Screen::Help, "Help"),
     ]
     .into_iter()
@@ -57,7 +61,7 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
 
     for (idx, tab) in tabs.into_iter().enumerate() {
         header_line.push(tab);
-        if idx < 3 {
+        if idx < 5 {
             header_line.push(Span::raw(" "));
         }
     }
@@ -74,13 +78,15 @@ fn render_body(frame: &mut Frame, area: Rect, app: &App) {
         Screen::Tenants => render_tenants(frame, area, app),
         Screen::AddTenant => render_add_tenant(frame, area, app),
         Screen::Preview => render_preview(frame, area, app),
+        Screen::GeneratedEvents => render_generated_events(frame, area, app),
+        Screen::Target => render_target(frame, area, app),
         Screen::Help => render_help(frame, area),
     }
 }
 
 fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
     let footer = Paragraph::new(format!(
-        "Keys: [1][2][3][h] jump  [a] add tenant  [e] edit tenant  [d] delete tenant  [Up/Down, j/k, PgUp/PgDn] list nav  [q/Ctrl+C] quit | Status: {}",
+        "Keys: [1][2][3][4][5][h] jump  [a] add tenant  [e] edit tenant  [d] delete tenant  [g] generate+export+send  [Up/Down, j/k, PgUp/PgDn] list nav  [q/Ctrl+C] quit | Status: {}",
         app.status_message
     ))
     .block(Block::default().borders(Borders::ALL).title("Controls"));
@@ -311,13 +317,75 @@ fn render_preview(frame: &mut Frame, area: Rect, app: &App) {
                 "Processed tasks: {}",
                 app.worker_preview.processed_tasks
             )),
+            Line::from(format!(
+                "Last generated events: {}",
+                app.last_generated_events
+            )),
+            Line::from(format!(
+                "Last export path: {}",
+                app.last_generated_output_path
+            )),
+            Line::from(format!(
+                "Target enabled: {} | target: {} | protocol: {}",
+                app.target_config.enabled,
+                app.active_target_system_label(),
+                app.active_protocol_label()
+            )),
+            Line::from(format!("Target endpoint: {}", app.target_config.endpoint)),
+            Line::from(format!(
+                "Send report: attempted={} succeeded={} failed={}",
+                app.send_preview.attempted, app.send_preview.succeeded, app.send_preview.failed
+            )),
+            Line::from(match &app.send_preview.last_error {
+                Some(error) => format!("Last send error: {}", error),
+                None => "Last send error: none".to_string(),
+            }),
             Line::from(match &app.worker_preview.last_error {
                 Some(error) => format!("Last submit error: {}", error),
                 None => "Last submit error: none".to_string(),
             }),
+            Line::from(match &app.generation_error {
+                Some(error) => format!("Last generation error: {}", error),
+                None => "Last generation error: none".to_string(),
+            }),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Generated Event Preview (first 5)",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(match app.last_generated_preview.first() {
+                Some(_) => "Press g to regenerate using current tenants".to_string(),
+                None => "No generated events yet. Press g to generate and export.".to_string(),
+            }),
+            Line::from(""),
+            Line::from(match app.last_generated_preview.first() {
+                Some(_) => "timestamp_ms | tenant_id | request_id | payload_size".to_string(),
+                None => "".to_string(),
+            }),
+            Line::from(""),
+            Line::from(
+                app.last_generated_preview
+                    .iter()
+                    .map(|event| {
+                        format!(
+                            "{} | {} | {} | {}",
+                            event.timestamp_ms,
+                            event.tenant_id,
+                            event.request_id,
+                            event.payload_size_bytes
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
             Line::from(""),
             Line::from(
                 "Tip: switch tenants in [Tenants] screen, then return here to observe load.",
+            ),
+            Line::from(
+                "Tip: press 4 to browse generated events, 5 for target config, or g to regenerate+send.",
             ),
         ]
     } else {
@@ -329,6 +397,119 @@ fn render_preview(frame: &mut Frame, area: Rect, app: &App) {
             Block::default()
                 .borders(Borders::ALL)
                 .title("Traffic Preview"),
+        )
+        .scroll((app.preview_scroll_offset, 0))
+        .wrap(Wrap { trim: true });
+
+    frame.render_widget(widget, area);
+}
+
+fn render_generated_events(frame: &mut Frame, area: Rect, app: &App) {
+    let visible_rows = area.height.saturating_sub(2) as usize;
+    let max_start = app
+        .generated_events
+        .len()
+        .saturating_sub(visible_rows.max(1));
+    let start = app.generated_event_scroll_offset.min(max_start);
+    let end = (start + visible_rows.max(1)).min(app.generated_events.len());
+
+    let items: Vec<ListItem> = app.generated_events[start..end]
+        .iter()
+        .enumerate()
+        .map(|(offset, event)| {
+            let marker = if start + offset == app.selected_generated_event {
+                ">"
+            } else {
+                " "
+            };
+            let line = Line::from(vec![
+                Span::raw(format!("{} ", marker)),
+                Span::styled(
+                    format!(
+                        "#{:>4} | ts={} | tenant={} | req={} | payload={}b",
+                        event.request_id,
+                        event.timestamp_ms,
+                        event.tenant_id,
+                        event.request_id,
+                        event.payload_size_bytes
+                    ),
+                    Style::default().fg(Color::Cyan),
+                ),
+            ]);
+            ListItem::new(line)
+        })
+        .collect();
+
+    let list = List::new(items).block(Block::default().borders(Borders::ALL).title(format!(
+        "Generated Events ({}/{})",
+        app.generated_events.len().min(app.selected_generated_event.saturating_add(1)),
+        app.generated_events.len()
+    )));
+
+    frame.render_widget(list, area);
+}
+
+fn render_target(frame: &mut Frame, area: Rect, app: &App) {
+    let field = |label: &str, value: String, is_active: bool| {
+        if is_active {
+            Line::from(vec![
+                Span::styled("-> ", Style::default().fg(Color::Yellow)),
+                Span::styled(
+                    format!("{}: {}", label, value),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+            ])
+        } else {
+            Line::from(format!("   {}: {}", label, value))
+        }
+    };
+
+    let text = vec![
+        Line::from(Span::styled(
+            "Outbound Target Configuration",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        field(
+            "enabled",
+            app.target_config.enabled.to_string(),
+            app.target_field == TargetField::Enabled,
+        ),
+        field(
+            "target",
+            app.active_target_system_label().to_string(),
+            app.target_field == TargetField::System,
+        ),
+        field(
+            "protocol",
+            app.active_protocol_label().to_string(),
+            app.target_field == TargetField::Protocol,
+        ),
+        field(
+            "endpoint",
+            app.target_config.endpoint.clone(),
+            app.target_field == TargetField::Endpoint,
+        ),
+        field(
+            "http_path",
+            app.target_config.http_path.clone(),
+            app.target_field == TargetField::HttpPath,
+        ),
+        Line::from(""),
+        Line::from("Controls: Tab/Shift+Tab move fields"),
+        Line::from("Controls: Left/Right toggle enabled or cycle target/protocol"),
+        Line::from("Controls: Type and Backspace to edit endpoint/path"),
+        Line::from("Tip: Target presets include Generic, NGINX, and HAProxy"),
+        Line::from("Controls: g generate+export+send using this config"),
+    ];
+
+    let widget = Paragraph::new(text)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Target Config"),
         )
         .wrap(Wrap { trim: true });
 
@@ -342,14 +523,17 @@ fn render_help(frame: &mut Frame, area: Rect) {
         Line::from("1       Go to Dashboard"),
         Line::from("2       Go to Tenants"),
         Line::from("3       Go to Traffic Preview"),
+        Line::from("4       Go to Generated Events"),
+        Line::from("5       Go to Target Config"),
         Line::from("h       Go to Help"),
         Line::from("q       Quit application"),
         Line::from("Ctrl+C  Quit application"),
-        Line::from("↑ / ↓   Move through tenant list"),
+        Line::from("↑ / ↓   Move through tenant and event lists"),
         Line::from("a       Open Add Tenant form"),
         Line::from("e       Open Edit Tenant form"),
         Line::from("d       Delete selected tenant"),
-        Line::from("PgUp/PgDn  Scroll tenant list faster"),
+        Line::from("g       Generate, export, and optionally send events"),
+        Line::from("PgUp/PgDn  Scroll faster"),
         Line::from("Tab     Focus next screen tab"),
         Line::from("Enter   Open focused tab"),
         Line::from(""),
