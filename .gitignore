@@ -28,3 +28,4 @@ target
 # Downloaded NGINX distribution and runtime logs (not source)
 /nginx/nginx-*/
 /nginx/*.zip
+/nginx/*.out

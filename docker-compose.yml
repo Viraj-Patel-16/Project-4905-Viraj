@@ -23,13 +23,72 @@ services:
     expose:
       - "9090"
 
+  tcpbackend1:
+    image: python:3.12-slim
+    container_name: comp4905-tcpbackend1
+    environment:
+      - MODE=tcp
+      - INSTANCE_NAME=tcp-backend1
+      - PORT=9092
+    volumes:
+      - ./docker/raw_backend.py:/app/raw_backend.py:ro
+    command: python /app/raw_backend.py
+    expose:
+      - "9092"
+
+  tcpbackend2:
+    image: python:3.12-slim
+    container_name: comp4905-tcpbackend2
+    environment:
+      - MODE=tcp
+      - INSTANCE_NAME=tcp-backend2
+      - PORT=9092
+    volumes:
+      - ./docker/raw_backend.py:/app/raw_backend.py:ro
+    command: python /app/raw_backend.py
+    expose:
+      - "9092"
+
+  udpbackend1:
+    image: python:3.12-slim
+    container_name: comp4905-udpbackend1
+    environment:
+      - MODE=udp
+      - INSTANCE_NAME=udp-backend1
+      - PORT=9094
+    volumes:
+      - ./docker/raw_backend.py:/app/raw_backend.py:ro
+    command: python /app/raw_backend.py
+    expose:
+      - "9094"
+
+  udpbackend2:
+    image: python:3.12-slim
+    container_name: comp4905-udpbackend2
+    environment:
+      - MODE=udp
+      - INSTANCE_NAME=udp-backend2
+      - PORT=9094
+    volumes:
+      - ./docker/raw_backend.py:/app/raw_backend.py:ro
+    command: python /app/raw_backend.py
+    expose:
+      - "9094"
+
   nginx:
     image: nginx:alpine
     container_name: comp4905-nginx
     depends_on:
       - backend1
       - backend2
+      - tcpbackend1
+      - tcpbackend2
+      - udpbackend1
+      - udpbackend2
     ports:
       - "8080:8080"
+      - "9000:9000"
+      - "9001:9001/udp"
     volumes:
       - ./docker/nginx.conf:/etc/nginx/nginx.conf:ro
+

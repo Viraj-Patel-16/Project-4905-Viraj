@@ -336,3 +336,96 @@ The project should follow these principles:
 * Export structured traffic events for future integration
 * Avoid implementing the scheduler/load balancer too early
 * Keep the first version small, testable, and demo-friendly
+
+---
+
+## 9. Load Balancer Integration (NGINX)
+
+The load balancer boundary described in Section 3.6 is now realized with a real
+NGINX instance. Generated traffic is sent by the producer to NGINX, which
+receives the requests and distributes them across backend application instances.
+This validates the producer against an industry-grade load balancer at both
+Layer 7 (HTTP) and Layer 4 (TCP/UDP).
+
+### 9.1 Layer 7 (HTTP) Path
+
+```text
++---------------------+
+|  Traffic Producer   |
+|  HTTP sender        |
++----------+----------+
+           | POST http://127.0.0.1:8080/traffic
+           v
++---------------------+
+|  NGINX  http {}     |
+|  listen :8080       |
+|  upstream app_*     |
++-----+---------+-----+
+      |         |
+      v         v
+ +---------+ +---------+
+ |backend1 | |backend2 |
+ | :9090   | | :9091   |
+ +---------+ +---------+
+```
+
+NGINX round-robins each HTTP request across `backend1` and `backend2`
+(`docker/backend.py`), which respond and log the request.
+
+### 9.2 Layer 4 (TCP/UDP) Path
+
+```text
++---------------------+           +---------------------+
+|  Traffic Producer   |           |  Traffic Producer   |
+|  TCP sender         |           |  UDP sender         |
++----------+----------+           +----------+----------+
+           | TCP 127.0.0.1:9000              | UDP 127.0.0.1:9001
+           v                                 v
++---------------------+           +---------------------+
+|  NGINX  stream {}   |           |  NGINX  stream {}   |
+|  listen :9000       |           |  listen :9001 udp   |
+|  upstream tcp_*     |           |  upstream udp_*     |
++-----+---------+-----+           +-----+---------+-----+
+      |         |                       |         |
+      v         v                       v         v
+ +---------+ +---------+           +---------+ +---------+
+ |tcp-be1  | |tcp-be2  |           |udp-be1  | |udp-be2  |
+ | :9092   | | :9093   |           | :9094   | | :9095   |
+ +---------+ +---------+           +---------+ +---------+
+```
+
+The raw TCP/UDP backends (`docker/raw_backend.py`) accept the newline-delimited
+JSON (TCP) or raw JSON datagrams (UDP) emitted by the producer's senders.
+
+### 9.3 Components
+
+| Component | Role | File |
+|-----------|------|------|
+| NGINX `http {}` | L7 HTTP reverse proxy + round-robin balancing | `nginx/comp4905.conf`, `docker/nginx.conf` |
+| NGINX `stream {}` | L4 TCP/UDP load balancing | `nginx/comp4905.conf` (TCP), `docker/nginx.conf` (TCP + UDP) |
+| HTTP backends | Receive proxied HTTP, log + respond | `docker/backend.py` |
+| Raw TCP/UDP backends | Receive proxied L4 traffic, log payloads | `docker/raw_backend.py` |
+| Docker stack | One-command reproducible deployment | `docker-compose.yml` |
+
+### 9.4 Environment Support
+
+| Protocol | Native Windows | Docker/Linux |
+|----------|----------------|--------------|
+| HTTP (L7) | Yes | Yes |
+| TCP (L4)  | Yes | Yes |
+| UDP (L4)  | No — Windows NGINX build lacks UDP stream support | Yes |
+
+Because the producer's default endpoints already match the NGINX listen ports
+(HTTP `:8080`, TCP `:9000`, UDP `:9001`), no producer code changes are required
+to route traffic through the load balancer.
+
+### 9.5 Validation
+
+NGINX records every request it receives, which serves as end-to-end evidence:
+
+* L7 HTTP requests → NGINX `access.log` (shows chosen HTTP backend)
+* L4 TCP/UDP sessions → NGINX `stream_access.log` (shows chosen upstream)
+* Backend processes log each received payload with their instance name
+
+Alternating upstream addresses across successive requests demonstrate active
+load balancing across the backend instances.
