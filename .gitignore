@@ -24,3 +24,7 @@ target
 # Added by cargo
 
 /target
+
+# Downloaded NGINX distribution and runtime logs (not source)
+/nginx/nginx-*/
+/nginx/*.zip
